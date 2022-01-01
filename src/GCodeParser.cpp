@@ -17,10 +17,13 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <fstream>
 
 
 const char* STOP_RESET_FILE = "/sys/class/cncController/cncC0/stop_reset";
+const char* STOP_FILE = "/sys/class/cncController/cncC0/stop_clear";
 const char* WRITE_DMA_FILE = "/sys/class/dma_class/dma-0/write_dma";
+const char* GCODEFILE = "/media/sd-mmcblk0p2/Part2.txt";
 const char* DMA_BUFFER = "/dev/dma-0";
 const int axi_clock_freq = 50000000;
 const int ns_per_clock = 1000000000/axi_clock_freq;
@@ -29,6 +32,8 @@ enum MOTORNUMBERS {MOTORNUMBERS_M1, MOTORNUMBERS_M2, MOTORNUMBERS_M3, MOTORNUMBE
 #define MOTOR_MOVE_BIT 0
 #define MOTOR_DIR_BIT 1
 #define bufflength 2048
+#define MAXTOOLCOUNT 20
+#define MAXSPINDLESPEED 10000
 
 
 
@@ -95,6 +100,17 @@ class cncHardwareControl {
 			printf("Failed to open sysfs file\n");
 		}
 		ret = write(rst_fd, _r?"1":"0", 1);
+		close(rst_fd);
+
+		return ret;
+	}
+	static int Stop_Bit() {
+		int ret;
+		int rst_fd = open(STOP_FILE, O_WRONLY | O_NONBLOCK);
+		if(rst_fd == -1) {
+			printf("Failed to open sysfs file\n");
+		}
+		ret = write(rst_fd, "1", 1);
 		close(rst_fd);
 
 		return ret;
@@ -171,11 +187,15 @@ enum CUBEPOSITIONS {XN1Y1Z1, X0Y1Z1, X1Y1Z1,
 
 
 
-enum GCODE_INSTRUCTION_TYPES {G_00, G_01, G_02, G_03, G_21, G_91, G_UNKOWN};
+enum GCODE_INSTRUCTION_TYPES {G_00, G_01, G_02, G_03, G_17, G_21, G_40, G_54, G_80, G_90, G_91, G_94, S_setspeed, M_03, M_06, G_NOTELINE, G_UNKOWN_STOP};
+struct TOOL_DATA {
+	std::string name;
+};
 class MachineParams {
 	public:
 	static constexpr const int encoder_precision = 6400;
 	static constexpr const double TPI = 10;
+	static constexpr const double Max_rpm = 1130;
 	static constexpr const double x_mm_per_tick = 1.0 / (encoder_precision * (TPI / 25.4));
 	static constexpr const double y_mm_per_tick = 1.0 / (encoder_precision * (TPI / 25.4));
 	static constexpr const double z_mm_per_tick = 1.0 / (encoder_precision * (TPI / 25.4));
@@ -185,10 +205,13 @@ class MachineParams {
 	static double time_y_move;
 	static double time_z_move;
 	static double time_xy_move;
+	static struct TOOL_DATA Tools[MAXTOOLCOUNT];
+	static struct TOOL_DATA *currentTool;
+	static int spindle_rpm;
 
 	static bool useMM;
 
-	static constexpr const double maxFeedrate_mm_sec = 17000 / 60.0;
+	static constexpr const double maxFeedrate_mm_sec = Max_rpm * 25.4 / (60.0 * 10.0);
 	static double Feedrate_mm_sec;
 
 	static void init() {
@@ -198,12 +221,17 @@ class MachineParams {
 		useMM = true;
 		setFeedrate(10);
 	}
+	static void setSpindleSpeed(int _rpm) {
+		if(_rpm > MAXSPINDLESPEED) _rpm = MAXSPINDLESPEED;
+		spindle_rpm = _rpm;
+	}
 	static void setFeedrate(double feed_dist_min) {
 		if(useMM) {
 			Feedrate_mm_sec = feed_dist_min / 60;
 		} else {
 			Feedrate_mm_sec = feed_dist_min * 25.4 / 60.0;
 		}
+		if(Feedrate_mm_sec > maxFeedrate_mm_sec) Feedrate_mm_sec = maxFeedrate_mm_sec;
 
 		time_x_move = x_mm_per_tick * 1000000000 / Feedrate_mm_sec;
 		time_y_move = y_mm_per_tick * 1000000000 / Feedrate_mm_sec;
@@ -224,7 +252,17 @@ class MachineParams {
 			return maxFeedrate_mm_sec * 60.0 / 25.4;
 		}
 	}
-
+	static void setAbsoluteMode() {
+		std::cout << "todo: add absolute mode\n";
+	}
+	static void setRelativeMode() {
+		std::cout << "todo: add relative mode\n";
+	}
+	static void setTool(int toolnumber) {
+		if(toolnumber < MAXTOOLCOUNT) {
+			currentTool = &Tools[toolnumber];
+		}
+	}
 	static void writemotors(enum CUBEPOSITIONS moveDirection) {
 		cncHardwareControl::unset_motors();
 		cncHardwareControl::setTimer(0);
@@ -419,13 +457,21 @@ double MachineParams::time_x_move;
 double MachineParams::time_y_move;
 double MachineParams::time_z_move;
 double MachineParams::time_xy_move;
+struct TOOL_DATA MachineParams::Tools[MAXTOOLCOUNT];
+struct TOOL_DATA *MachineParams::currentTool = nullptr;
+int MachineParams::spindle_rpm = 100;
 
-
+#define MAX_WORK_COORDINATE_OFFSETS 6
 class CNC_GCODE_PROCESSING {
 	public:
-	static struct coordinate_s RealPosition;
+	//these coordinate are in reference to machine datum - offsets are added to the gcode location to correct to machine coordinates
+	static struct coordinate_s MotorQuadrantPosition;
 	static struct coordinate_s VirtualPosition;
 	static struct coordinate_s last_exact_gcode_point;
+
+
+	static struct coordinate_s WorkCoordinateOffsets[MAX_WORK_COORDINATE_OFFSETS];
+	static struct coordinate_s *current_work_offset;
 
 	static struct coordinate_s PossiblePositions[POS_LENGTH];
 	static struct coordinate_s VirtualOutcomePositions[POS_LENGTH];
@@ -434,29 +480,129 @@ class CNC_GCODE_PROCESSING {
 
 	static std::vector<std::string> fileContents;
 	static void LoadFile(const char* filename) {
-		fileContents.push_back("G00 Z5.000000");
-		fileContents.push_back("G00 X5 Y5");
-		fileContents.push_back("G01 X5 Y25 F400.0000");
-		fileContents.push_back("G01 X25 Y25");
-		fileContents.push_back("G02 X35 Y15 I0 J-10");
-		fileContents.push_back("G02 X31 Y7 I-10 J0");
-		fileContents.push_back("G01 X5 Y5");
-		fileContents.push_back("G03 X-5 Y-5 I-5 J-5");
+		std::string line;
+		std::ifstream gcodefile(filename);
+		if(gcodefile.is_open()) {
+			while(std::getline(gcodefile, line)) {
+				fileContents.push_back(line);
+			}
+			gcodefile.close();
+		}
+
+		// fileContents.push_back("G00 Z5.000000");
+		// fileContents.push_back("G00 X5 Y5");
+		// fileContents.push_back("G01 X5 Y25 F200.0000");
+		// fileContents.push_back("G01 X25 Y25");
+		// fileContents.push_back("G02 X35 Y15 I0 J-10");
+		// fileContents.push_back("G02 X31 Y7 I-10 J0");
+		// fileContents.push_back("G01 X5 Y5");
+		// fileContents.push_back("G03 X-5 Y-5 I-5 J-5");
 
 	}
-
+	static void emergency_stop() {
+		cncHardwareControl::Stop_Bit();
+		cncHardwareControl::flush();
+		cncHardwareControl::ForceWriteDMA();
+		return;
+	}
 	static void runGcodeFile() {
+		std::vector<enum GCODE_INSTRUCTION_TYPES> gcode_setup_list;
 		for(auto line_it = fileContents.begin(); line_it < fileContents.end(); line_it++) {
-
-			enum GCODE_INSTRUCTION_TYPES *gcode_type_ptr = nullptr;
+			// gcode_list.clear();
+			enum GCODE_INSTRUCTION_TYPES *gcode_move_ptr = nullptr;
 			struct coordinate_s *endpoint_ptr = nullptr;
 			struct coordinate_s *centerpoint_ptr = nullptr;
 			double *feedrate_ptr = nullptr;
-			// std::cout << *line_it << "\n";
+			int *toolNumber_ptr = nullptr;
+			int *aux_data_ptr = nullptr;
+			std::cout << *line_it << "\n";
 
-			GCODE_PARSE(*line_it, &gcode_type_ptr, &endpoint_ptr, &centerpoint_ptr, &feedrate_ptr);
-			if(gcode_type_ptr) {
-				switch(*gcode_type_ptr) {
+			GCODE_PARSE(*line_it, gcode_setup_list, &gcode_move_ptr, &endpoint_ptr, &centerpoint_ptr, &feedrate_ptr, &toolNumber_ptr, &aux_data_ptr);
+			//process non movement gcode
+			//correct for machine offsets
+			//process movement gcode 
+			for(auto gcode_it = gcode_setup_list.begin(); gcode_it < gcode_setup_list.end(); gcode_it++) {
+				switch(*gcode_it) {
+					case(G_17): {
+						std::cout << "Set Machine in XY plane(other planes not supported so no action)\n";
+						break;
+					}
+					case(G_21): {
+						std::cout << "Set Machine to MM\n";
+						MachineParams::useMM = true;
+						break;
+					}
+					case(G_40): {
+						std::cout << "Turn off cutter compensation\n";
+						break;
+					}
+					case(G_54): {
+						current_work_offset = &WorkCoordinateOffsets[0];
+						break;
+					}
+					case(G_80): {
+						std::cout << "Cancel canned cycles(no action supported)\n";
+						break;
+					}
+					case(G_90): {
+						MachineParams::setAbsoluteMode();
+						break;
+					}
+					case(G_91): {
+						MachineParams::setRelativeMode();
+						break;
+					}
+					case(G_94): {
+						std::cout << "Set feed/minute scale\n";
+						break;
+					}
+					case(M_06): {
+						if(toolNumber_ptr) {
+							MachineParams::setTool(*toolNumber_ptr);
+						} else {
+							emergency_stop();
+						}
+						break;
+					}
+					case(M_03): {
+						std::cout << "todo: turn on spindle\n";
+						break;
+					}
+					case(S_setspeed): {
+						if(aux_data_ptr) {
+							MachineParams::setSpindleSpeed(*aux_data_ptr);
+						} else {
+							emergency_stop();
+						}
+						break;
+					}
+					case(G_UNKOWN_STOP): {
+						//emergency stop because we don't know how to handle this code yet
+						emergency_stop();
+						return;
+					}
+					default: {
+						std::cout << "No Op\n";
+						break;
+					}
+					
+				}
+			}
+			if(current_work_offset) {
+				if(endpoint_ptr) {
+					endpoint_ptr->x += current_work_offset->x;
+					endpoint_ptr->y += current_work_offset->y;
+					endpoint_ptr->z += current_work_offset->z;
+				}
+				if(centerpoint_ptr) {
+					centerpoint_ptr->x += current_work_offset->x;
+					centerpoint_ptr->y += current_work_offset->y;
+					centerpoint_ptr->z += current_work_offset->z;
+
+				}
+			}
+			if(gcode_move_ptr) {
+				switch(*gcode_move_ptr) {
 					case(G_00): {
 						if(endpoint_ptr) {
 							double oldFeedrate = MachineParams::getFeedrate();
@@ -495,21 +641,13 @@ class CNC_GCODE_PROCESSING {
 						}
 						break;
 					}
-					case(G_21): {
-						break;
-					}
-					case(G_91): {
-						break;
-					}
 					default: {
-						std::cout << "Code Not supported\n";
-						return;
+						std::cout << "Move code not supported\n";
+						emergency_stop();
+						break;
 					}
-					
 				}
-
 			}
-				
 			if(endpoint_ptr) {
 				last_exact_gcode_point = *endpoint_ptr;
 			}
@@ -518,16 +656,22 @@ class CNC_GCODE_PROCESSING {
 		cncHardwareControl::ForceWriteDMA();
 	}
 
-	static void GCODE_PARSE(std::string line, enum GCODE_INSTRUCTION_TYPES **_gcode_type, struct coordinate_s **_endpoint, struct coordinate_s **_centerpoint, double **_feedrate) {
-		static enum GCODE_INSTRUCTION_TYPES gcode_type;
+	static void GCODE_PARSE(std::string line, std::vector<enum GCODE_INSTRUCTION_TYPES> &_gcode_setup_list, GCODE_INSTRUCTION_TYPES **_gcode_move, 
+							struct coordinate_s **_endpoint, struct coordinate_s **_centerpoint, double **_feedrate, int **_toolnumber, int **_aux_data) {
+		static enum GCODE_INSTRUCTION_TYPES gcode_move;
 		static struct coordinate_s endpoint;
 		static struct coordinate_s centerpoint;
 		static double feedrate;
+		static int toolnumber;
+		static int aux_data;
 
-		*_gcode_type = nullptr;
+		_gcode_setup_list.clear();
+		*_gcode_move = nullptr;
 		*_endpoint = nullptr;
 		*_centerpoint = nullptr;
 		*_feedrate = nullptr;
+		*_toolnumber = nullptr;
+		*_aux_data = nullptr;
 		
 		char space_del = ' ';
 		std::vector<std::string> words;
@@ -540,6 +684,10 @@ class CNC_GCODE_PROCESSING {
 		endpoint = last_exact_gcode_point;
 		
 		for(auto word = words.begin(); word < words.end(); word++) {
+			if(word->length() == 1) {
+				//this is mainly to deal with a comment word with a single ( ex. N1 G00 ( comment )
+				return;
+			}
 			if(word->length() >= 2) {
 				char first_char = (*word)[0];
 				// std::cout << first_char << "\n";
@@ -548,43 +696,104 @@ class CNC_GCODE_PROCESSING {
 				switch(first_char) {
 					case('G'):{
 						int temp_i = std::stoi(*word);
-						*_gcode_type = &gcode_type;
 						switch(temp_i) {
 							case(0): {
 								//rapid
-								gcode_type = G_00;
+								*_gcode_move = &gcode_move;
+								gcode_move = G_00;
 								break;
 							}
 							case(1): {
 								//linear
-								gcode_type = G_01;
+								*_gcode_move = &gcode_move;
+								gcode_move = G_01;
 								break;
 							}
 							case(2): {
 								//clockwise circle
-								gcode_type = G_02;
+								*_gcode_move = &gcode_move;
+								gcode_move = G_02;
 								break;
 							}
 							case(3): {
 								//counterclockwise circle
-								gcode_type = G_03;
+								*_gcode_move = &gcode_move;
+								gcode_move = G_03;
+								break;
+							}
+							case(17): {
+								//set XY plane
+								_gcode_setup_list.push_back(G_17);
 								break;
 							}
 							case(21): {
 								//set mm
-								gcode_type = G_21;
+								_gcode_setup_list.push_back(G_21);
+								break;
+							}
+							case(40): {
+								//disable tool radius compensation
+								_gcode_setup_list.push_back(G_40);
+								break;
+							}
+							case(54): {
+								//coordinate offset for workpiece
+								_gcode_setup_list.push_back(G_54);
+								break;
+							}
+							case(80): {
+								//cancel canned cycles
+								_gcode_setup_list.push_back(G_80);
+								break;
+							}
+							case(90): {
+								//set absolute
+								_gcode_setup_list.push_back(G_90);
 								break;
 							}
 							case(91): {
-								//set absolute
-								gcode_type = G_91;
+								//set relative
+								_gcode_setup_list.push_back(G_91);
+								break;
+							}
+							case(94): {
+								//set feed to feed/minute (mm/in set somewhere else)
+								_gcode_setup_list.push_back(G_94);
 								break;
 							}
 							default: {
-								gcode_type = G_UNKOWN;
+								_gcode_setup_list.push_back(G_UNKOWN_STOP);
 								break;
 							}
 						}
+						break;
+					}
+					case('M'): {
+						int temp_i = std::stoi(*word);
+						switch(temp_i) {
+							case(6): {
+								//tool change
+								_gcode_setup_list.push_back(M_06);
+								break;
+							}
+							case(3): {
+								//turn on spindle
+								_gcode_setup_list.push_back(M_03);
+								break;
+							}
+							default: {
+								_gcode_setup_list.push_back(G_UNKOWN_STOP);
+								break;
+							}
+						}
+						break;
+					}
+					case('S'): {
+						//set spindle speed
+						int temp_i = std::stoi(*word);
+						*_aux_data = &aux_data;
+						aux_data = temp_i;
+						_gcode_setup_list.push_back(S_setspeed);
 						break;
 					}
 					case('X'): {
@@ -623,13 +832,33 @@ class CNC_GCODE_PROCESSING {
 						feedrate = temp_d;
 						break;
 					}
+					case('N'): {
+						break;
+					}
+					case('T'): {
+						int temp_int = std::stoi(*word);
+						*_toolnumber = &toolnumber;
+						toolnumber = temp_int;
+						break;
+					}
+					case('%'):
+					case('O'):
+					case('('):
+					{
+						_gcode_setup_list.push_back(G_NOTELINE);
+						return;
+					}
 					default: {
-						assert(0);
+						_gcode_setup_list.push_back(G_UNKOWN_STOP);
 					}
 				}
 			}
 		}
 
+		if(*_endpoint && _gcode_setup_list.empty()) {
+			//if we have an enpoint set and no other setup paramaters then run with the last move command
+			*_gcode_move = &gcode_move;
+		}
 		return;
 	}
 	static void moveCircle(struct coordinate_s end, struct coordinate_s center, bool clockwise) {
@@ -638,7 +867,7 @@ class CNC_GCODE_PROCESSING {
 
 		while (keeprunning) {
 			moveDirection = X0Y0Z0;
-			fillPossibleLocations(RealPosition, MachineParams::x_mm_per_tick, MachineParams::y_mm_per_tick, MachineParams::z_mm_per_tick);
+			fillPossibleLocations(MotorQuadrantPosition, MachineParams::x_mm_per_tick, MachineParams::y_mm_per_tick, MachineParams::z_mm_per_tick);
 
 			// check for Y vector only(no slope)
 			if(center.x == VirtualPosition.x) {
@@ -683,9 +912,9 @@ class CNC_GCODE_PROCESSING {
 				VirtualPosition.x = VirtualOutcomePositions[moveDirection].x;
 				VirtualPosition.y = VirtualOutcomePositions[moveDirection].y;
 				VirtualPosition.z = VirtualOutcomePositions[moveDirection].z;
-				RealPosition.x = PossiblePositions[moveDirection].x;
-				RealPosition.y = PossiblePositions[moveDirection].y;
-				RealPosition.z = PossiblePositions[moveDirection].z;
+				MotorQuadrantPosition.x = PossiblePositions[moveDirection].x;
+				MotorQuadrantPosition.y = PossiblePositions[moveDirection].y;
+				MotorQuadrantPosition.z = PossiblePositions[moveDirection].z;
 				// std::cout << "X:" << VirtualPosition.x << "    Y:" << VirtualPosition.y << "     RX:" << RealPosition.x << "     RY:" << RealPosition.y << "\n";
 			} else {
 				keeprunning = false;
@@ -701,7 +930,7 @@ class CNC_GCODE_PROCESSING {
 		enum CUBEPOSITIONS moveDirection;
 		while(keeprunning){
 			moveDirection = X0Y0Z0;
-			fillPossibleLocations(RealPosition, MachineParams::x_mm_per_tick, MachineParams::y_mm_per_tick, MachineParams::z_mm_per_tick);
+			fillPossibleLocations(MotorQuadrantPosition, MachineParams::x_mm_per_tick, MachineParams::y_mm_per_tick, MachineParams::z_mm_per_tick);
 
 			if(Xdir == true && Ydir == false && Zdir == false) {
 				//move x only
@@ -778,9 +1007,9 @@ class CNC_GCODE_PROCESSING {
 				VirtualPosition.x = VirtualOutcomePositions[moveDirection].x;
 				VirtualPosition.y = VirtualOutcomePositions[moveDirection].y;
 				VirtualPosition.z = VirtualOutcomePositions[moveDirection].z;
-				RealPosition.x = PossiblePositions[moveDirection].x;
-				RealPosition.y = PossiblePositions[moveDirection].y;
-				RealPosition.z = PossiblePositions[moveDirection].z;
+				MotorQuadrantPosition.x = PossiblePositions[moveDirection].x;
+				MotorQuadrantPosition.y = PossiblePositions[moveDirection].y;
+				MotorQuadrantPosition.z = PossiblePositions[moveDirection].z;
 			} else {
 				keeprunning = false;
 			}
@@ -1060,13 +1289,15 @@ class CNC_GCODE_PROCESSING {
 
 std::vector<std::string> CNC_GCODE_PROCESSING::fileContents;
 	
-struct coordinate_s CNC_GCODE_PROCESSING::RealPosition = {0};
+struct coordinate_s CNC_GCODE_PROCESSING::MotorQuadrantPosition = {0};
 struct coordinate_s CNC_GCODE_PROCESSING::VirtualPosition = {0};
 struct coordinate_s CNC_GCODE_PROCESSING::last_exact_gcode_point = {0};
 struct coordinate_s CNC_GCODE_PROCESSING::PossiblePositions[POS_LENGTH];
 struct coordinate_s CNC_GCODE_PROCESSING::VirtualOutcomePositions[POS_LENGTH];
 bool CNC_GCODE_PROCESSING::PossiblePositions_bool[POS_LENGTH];
 double CNC_GCODE_PROCESSING::PossiblePositions_dist[POS_LENGTH];
+struct coordinate_s CNC_GCODE_PROCESSING::WorkCoordinateOffsets[MAX_WORK_COORDINATE_OFFSETS];
+struct coordinate_s *CNC_GCODE_PROCESSING::current_work_offset = nullptr;
 
 int main() {
 	std::cout << "!!!Hello World!!!" << std::endl; // prints !!!Hello World!!!
@@ -1080,7 +1311,7 @@ int main() {
 
 	cncHardwareControl::Reset_Stop_Bit(true);
 
-	CNC_GCODE_PROCESSING::LoadFile("test_file");
+	CNC_GCODE_PROCESSING::LoadFile(GCODEFILE);
 	// double total_time = 0;
 	std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
 	CNC_GCODE_PROCESSING::runGcodeFile();
