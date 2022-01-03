@@ -23,7 +23,7 @@
 const char* STOP_RESET_FILE = "/sys/class/cncController/cncC0/stop_reset";
 const char* STOP_FILE = "/sys/class/cncController/cncC0/stop_clear";
 const char* WRITE_DMA_FILE = "/sys/class/dma_class/dma-0/write_dma";
-const char* GCODEFILE = "/media/sd-mmcblk0p2/Part2.txt";
+const char* GCODEFILE = "/media/sd-mmcblk0p2/Part1.txt";
 const char* DMA_BUFFER = "/dev/dma-0";
 const int axi_clock_freq = 50000000;
 const int ns_per_clock = 1000000000/axi_clock_freq;
@@ -187,9 +187,12 @@ enum CUBEPOSITIONS {XN1Y1Z1, X0Y1Z1, X1Y1Z1,
 
 
 
-enum GCODE_INSTRUCTION_TYPES {G_00, G_01, G_02, G_03, G_17, G_21, G_40, G_54, G_80, G_90, G_91, G_94, S_setspeed, M_03, M_06, G_NOTELINE, G_UNKOWN_STOP};
+enum GCODE_INSTRUCTION_TYPES {G_00, G_01, G_02, G_03, G_17, G_21, G_40, G_41, G_43, G_49, G_53, G_54, G_80, G_90, G_91, G_94, S_setspeed, M_03, M_05, M_06, M_08, M_09, G_NOTELINE, G_UNKOWN_STOP};
+enum CUTTER_COMPENSATION {CUTTER_COMPENSATION_LEFT, CUTTER_COMPENSATION_RIGHT, CUTTER_COMPENSATION_COUNT};
 struct TOOL_DATA {
-	std::string name;
+	struct coordinate_s offset;
+
+	double CutterCompensation[CUTTER_COMPENSATION_COUNT];
 };
 class MachineParams {
 	public:
@@ -206,7 +209,10 @@ class MachineParams {
 	static double time_z_move;
 	static double time_xy_move;
 	static struct TOOL_DATA Tools[MAXTOOLCOUNT];
-	static struct TOOL_DATA *currentTool;
+	static int currentTool_Number;
+	static struct TOOL_DATA *currentTool_offset;
+	static struct TOOL_DATA *currentTool_diameter_compensation;
+	static enum CUTTER_COMPENSATION cutter_compensation_direction;
 	static int spindle_rpm;
 
 	static bool useMM;
@@ -232,6 +238,8 @@ class MachineParams {
 			Feedrate_mm_sec = feed_dist_min * 25.4 / 60.0;
 		}
 		if(Feedrate_mm_sec > maxFeedrate_mm_sec) Feedrate_mm_sec = maxFeedrate_mm_sec;
+
+		Feedrate_mm_sec = maxFeedrate_mm_sec;
 
 		time_x_move = x_mm_per_tick * 1000000000 / Feedrate_mm_sec;
 		time_y_move = y_mm_per_tick * 1000000000 / Feedrate_mm_sec;
@@ -260,7 +268,33 @@ class MachineParams {
 	}
 	static void setTool(int toolnumber) {
 		if(toolnumber < MAXTOOLCOUNT) {
-			currentTool = &Tools[toolnumber];
+			currentTool_Number = toolnumber;
+		}
+	}
+	static void enableCutterCompensation(int toolnumber, enum CUTTER_COMPENSATION direction) {
+		if(toolnumber < MAXTOOLCOUNT) {
+			//relying on correct gcode to set this equal to current tool
+			//don't want to limit possibilities of using different offsets
+			if(toolnumber == 0) {
+				currentTool_diameter_compensation = nullptr;
+			} else {
+				cutter_compensation_direction = direction;
+				currentTool_diameter_compensation = &Tools[toolnumber];
+			}
+		}
+	}
+	static bool isCutterCompensationEnabled() {
+		return (currentTool_diameter_compensation);
+	}
+	static void enableToolOffset(int toolnumber) {
+		if(toolnumber < MAXTOOLCOUNT) {
+			//relying on correct gcode to set this equal to current tool
+			//don't want to limit possibilities of using different offsets
+			if(toolnumber == 0) {
+				currentTool_offset = nullptr;
+			} else {
+				currentTool_offset = &Tools[toolnumber];
+			}
 		}
 	}
 	static void writemotors(enum CUBEPOSITIONS moveDirection) {
@@ -458,7 +492,10 @@ double MachineParams::time_y_move;
 double MachineParams::time_z_move;
 double MachineParams::time_xy_move;
 struct TOOL_DATA MachineParams::Tools[MAXTOOLCOUNT];
-struct TOOL_DATA *MachineParams::currentTool = nullptr;
+int MachineParams::currentTool_Number = 0;
+struct TOOL_DATA *MachineParams::currentTool_offset = nullptr;
+struct TOOL_DATA *MachineParams::currentTool_diameter_compensation = nullptr;
+enum CUTTER_COMPENSATION MachineParams::cutter_compensation_direction = (CUTTER_COMPENSATION)0;
 int MachineParams::spindle_rpm = 100;
 
 #define MAX_WORK_COORDINATE_OFFSETS 6
@@ -466,8 +503,12 @@ class CNC_GCODE_PROCESSING {
 	public:
 	//these coordinate are in reference to machine datum - offsets are added to the gcode location to correct to machine coordinates
 	static struct coordinate_s MotorQuadrantPosition;
-	static struct coordinate_s VirtualPosition;
+	// static struct coordinate_s VirtualPosition;
+
+	//uncorrected gcode locations
+	static struct coordinate_s last_corrected_gcode_position;
 	static struct coordinate_s last_exact_gcode_point;
+	static struct coordinate_s current_exact_gcode_point;
 
 
 	static struct coordinate_s WorkCoordinateOffsets[MAX_WORK_COORDINATE_OFFSETS];
@@ -489,15 +530,18 @@ class CNC_GCODE_PROCESSING {
 			gcodefile.close();
 		}
 
-		// fileContents.push_back("G00 Z5.000000");
-		// fileContents.push_back("G00 X5 Y5");
-		// fileContents.push_back("G01 X5 Y25 F200.0000");
-		// fileContents.push_back("G01 X25 Y25");
-		// fileContents.push_back("G02 X35 Y15 I0 J-10");
-		// fileContents.push_back("G02 X31 Y7 I-10 J0");
-		// fileContents.push_back("G01 X5 Y5");
-		// fileContents.push_back("G03 X-5 Y-5 I-5 J-5");
-
+		// fileContents.push_back("N2870 G00 G90 G53 G49 H0 Z0 M05");
+		// fileContents.push_back("N2875 T03 M06 (12MM CRB 2FL 25 LOC)");
+		// fileContents.push_back("N2880 G54 G90 G94");
+		// fileContents.push_back("N2885 S6557 M03");
+		// fileContents.push_back("N2890 G90 X5 Y5");
+		// fileContents.push_back("N2895 G43 H03 Z10 M08");
+		// fileContents.push_back("N2900 G01 Z5 F183.202");
+		// //y2
+		// fileContents.push_back("N2905 G90 G41 X6 Y1 D03 F549.607");
+		// fileContents.push_back("N2915 G01 X10");
+		// fileContents.push_back("N1 G03 X15 Y6 I0 J5");
+		// fileContents.push_back("N2915 G01 Y10");
 	}
 	static void emergency_stop() {
 		cncHardwareControl::Stop_Bit();
@@ -518,6 +562,9 @@ class CNC_GCODE_PROCESSING {
 			std::cout << *line_it << "\n";
 
 			GCODE_PARSE(*line_it, gcode_setup_list, &gcode_move_ptr, &endpoint_ptr, &centerpoint_ptr, &feedrate_ptr, &toolNumber_ptr, &aux_data_ptr);
+			if(endpoint_ptr && gcode_move_ptr) {
+				current_exact_gcode_point = *endpoint_ptr;
+			}
 			//process non movement gcode
 			//correct for machine offsets
 			//process movement gcode 
@@ -534,6 +581,34 @@ class CNC_GCODE_PROCESSING {
 					}
 					case(G_40): {
 						std::cout << "Turn off cutter compensation\n";
+						MachineParams::enableCutterCompensation(0, (CUTTER_COMPENSATION)0);
+						break;
+					}
+					case(G_41): {
+						std::cout << "Turn on left cutter compensation\n";
+						if(toolNumber_ptr) {
+							MachineParams::enableCutterCompensation(*toolNumber_ptr, CUTTER_COMPENSATION_LEFT);
+						} else {
+							emergency_stop();
+						}
+						break;
+					}
+					case(G_43): {
+						if(toolNumber_ptr) {
+							MachineParams::enableToolOffset(*toolNumber_ptr);
+						} else {
+							emergency_stop();
+						}
+						break;
+					}
+					case(G_49): {
+						//0 tool offset will not be able to be changed
+						MachineParams::enableToolOffset(0);
+						break;
+					}
+					case(G_53): {
+						//reset to machine coordinates
+						current_work_offset = nullptr;
 						break;
 					}
 					case(G_54): {
@@ -565,7 +640,19 @@ class CNC_GCODE_PROCESSING {
 						break;
 					}
 					case(M_03): {
-						std::cout << "todo: turn on spindle\n";
+						std::cout << "todo: turn on spindle clockwise\n";
+						break;
+					}
+					case(M_05): {
+						std::cout << "todo: turn off spindle\n";
+						break;
+					}
+					case(M_08): {
+						std::cout << "todo: turn on coolant\n";
+						break;
+					}
+					case(M_09): {
+						std::cout << "todo: turn off coolant\n";
 						break;
 					}
 					case(S_setspeed): {
@@ -588,6 +675,243 @@ class CNC_GCODE_PROCESSING {
 					
 				}
 			}
+			
+			if(gcode_move_ptr && endpoint_ptr) {
+				if(MachineParams::isCutterCompensationEnabled()) {
+					//peek at the next endpoint so we can calculate where to stop the cutter
+					// bool cutter_comp_off = false;
+					enum GCODE_INSTRUCTION_TYPES *temp_gcode_move_ptr = nullptr;
+					struct coordinate_s *temp_endpoint_ptr = nullptr;
+					struct coordinate_s *temp_centerpoint_ptr = nullptr;
+
+					for(auto temp_line_it = (line_it + 1); temp_line_it < fileContents.end(); temp_line_it++) {
+						// gcode_list.clear();
+						std::cout << *temp_line_it << "\n";
+
+						GCODE_PEEKFORCUTTERCOMP(*temp_line_it, &current_exact_gcode_point, &temp_gcode_move_ptr, &temp_endpoint_ptr, &temp_centerpoint_ptr);
+						if((temp_gcode_move_ptr && temp_endpoint_ptr)) {
+							//turning off
+							break;
+						}
+					}
+					if(temp_gcode_move_ptr && temp_endpoint_ptr) {
+						switch (*gcode_move_ptr){
+							case(G_00): 
+							case(G_01): {
+								//straight line to line
+								if(*temp_gcode_move_ptr == G_00 || *temp_gcode_move_ptr == G_01) {
+									double vec_x = temp_endpoint_ptr->x - endpoint_ptr->x;
+									double vec_y = temp_endpoint_ptr->y - endpoint_ptr->y;
+									double magnitude = std::sqrt(std::pow(vec_x,2) + std::pow(vec_y,2));
+									double vec_x_shift = 0;
+									double vec_y_shift = 0;
+									if(magnitude != 0) {
+										if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_LEFT) {
+											vec_x_shift = -(vec_y / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+											vec_y_shift = (vec_x / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										} else if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_RIGHT) {
+											vec_x_shift = (vec_y / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+											vec_y_shift = -(vec_x / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										} else {
+											std::cout << "cutter compensation not set correctly\n";
+											//skip changing endpoint
+											break;
+										}
+									}
+									struct coordinate_s temp_shift_start = {.x = endpoint_ptr->x + vec_x_shift, .y = endpoint_ptr->y + vec_y_shift, .z = endpoint_ptr->z };
+									temp_endpoint_ptr->x += vec_x_shift;
+									temp_endpoint_ptr->y += vec_y_shift;
+									double bottomstop_slope = temp_endpoint_ptr->x - temp_shift_start.x;
+									double bottompath_slope = endpoint_ptr->x - last_exact_gcode_point.x;
+									bool path_is_line = false;
+									bool stop_is_line = false;
+									double path_slope;
+									double path_b;
+									double stop_slope;
+									double stop_b;
+									if(bottompath_slope != 0) {
+										path_is_line = true;
+										path_slope = (endpoint_ptr->y - last_exact_gcode_point.y) / (bottompath_slope);
+										//y=mx+b
+										path_b = endpoint_ptr->y - (path_slope*endpoint_ptr->x);
+									}
+									if(bottomstop_slope != 0) {
+										stop_is_line = true;
+										stop_slope = (temp_endpoint_ptr->y - temp_shift_start.y) / (bottomstop_slope);
+										//y=mx+b
+										stop_b = temp_shift_start.y - (stop_slope*temp_shift_start.x);
+									}
+									//if path is line and stop is vert
+									if(path_is_line && !stop_is_line) {
+										//stop x is constant so solve for endpoint directly
+										endpoint_ptr->x = temp_shift_start.x;
+										endpoint_ptr->y = path_slope * endpoint_ptr->x + path_b;
+									} else if(!path_is_line && stop_is_line) {
+										//path is constant x so solve for endpoint directly
+										endpoint_ptr->y = stop_slope * endpoint_ptr->x + stop_b;
+									} else if(path_is_line && stop_is_line) {
+										//find intersection for new stop point
+										get_line_line_intersection(path_slope, path_b, stop_slope, stop_b, endpoint_ptr);
+									}
+								} 
+								//straight line to circle
+								else if(*temp_gcode_move_ptr == G_02 && temp_centerpoint_ptr) {
+									//clockwise move
+									double vec_x = endpoint_ptr->x - temp_centerpoint_ptr->x;
+									double vec_y = endpoint_ptr->y - temp_centerpoint_ptr->y;
+									double magnitude = std::sqrt(std::pow(vec_x,2) + std::pow(vec_y,2));
+									double vec_x_shift = 0;
+									double vec_y_shift = 0;
+									if(magnitude != 0) {
+										if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_LEFT) {
+											//radius will grow
+											vec_x_shift = (vec_x / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+											vec_y_shift = (vec_y / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										} else if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_RIGHT) {
+											//radius will shrink
+											vec_x_shift = -(vec_x / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+											vec_y_shift = -(vec_y / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										} else {
+											std::cout << "cutter compensation not set correctly\n";
+											//skip changing endpoint
+											break;
+										}
+									}
+									endpoint_ptr->x = temp_centerpoint_ptr->x + vec_x + vec_x_shift;
+									endpoint_ptr->y = temp_centerpoint_ptr->y + vec_y + vec_y_shift;
+								} else if(*temp_gcode_move_ptr == G_03 && temp_centerpoint_ptr) {
+									//counterclockwise move
+									double vec_x = endpoint_ptr->x - temp_centerpoint_ptr->x;
+									double vec_y = endpoint_ptr->y - temp_centerpoint_ptr->y;
+									double magnitude = std::sqrt(std::pow(vec_x,2) + std::pow(vec_y,2));
+									double vec_x_shift = 0;
+									double vec_y_shift = 0;
+									if(magnitude != 0) {
+										if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_LEFT) {
+											//radius will shrink
+											vec_x_shift = -(vec_x / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+											vec_y_shift = -(vec_y / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										} else if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_RIGHT) {
+											//radius will grow
+											vec_x_shift = (vec_x / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+											vec_y_shift = (vec_y / magnitude) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										} else {
+											std::cout << "cutter compensation not set correctly\n";
+											//skip changing endpoint
+											break;
+										}
+									}
+									endpoint_ptr->x = temp_centerpoint_ptr->x + vec_x + vec_x_shift;
+									endpoint_ptr->y = temp_centerpoint_ptr->y + vec_y + vec_y_shift;
+								}
+								break;
+							}
+							case(G_02): {
+								if(!centerpoint_ptr) break;
+								// double vec_x_tocenter = centerpoint_ptr->x - last_exact_gcode_point.x;
+								// double vec_y_tocenter = centerpoint_ptr->y - last_exact_gcode_point.y;
+								// double magnitude_tocenter = std::sqrt(std::pow(vec_x_tocenter,2) + std::pow(vec_y_tocenter,2));
+								// double vec_x_shift = 0;
+								// double vec_y_shift = 0;
+								// if(magnitude_tocenter != 0) {
+									// if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_LEFT) {
+										//radius will grow
+										// vec_x_shift = (vec_x_tocenter / magnitude_tocenter) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										// vec_y_shift = (vec_y_tocenter / magnitude_tocenter) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+									// } else if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_RIGHT) {
+										//radius will shrink
+										// vec_x_shift = -(vec_x_tocenter / magnitude_tocenter) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										// vec_y_shift = -(vec_y_tocenter / magnitude_tocenter) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+									// } else {
+										// std::cout << "cutter compensation not set correctly\n";
+										//skip changing endpoint
+										// break;
+									// }
+								// }
+								// centerpoint_ptr->x = last_exact_gcode_point.x + vec_x_tocenter + vec_x_shift;
+								// centerpoint_ptr->y = last_exact_gcode_point.y + vec_y_tocenter + vec_y_shift;
+								//center -> stop add offset
+								double vec_x_toend = endpoint_ptr->x - centerpoint_ptr->x;
+								double vec_y_toend = endpoint_ptr->y - centerpoint_ptr->y;
+								double magnitude_toend = std::sqrt(std::pow(vec_x_toend,2) + std::pow(vec_y_toend,2));
+								double vec_x_shift = 0;
+								double vec_y_shift = 0;
+								if(magnitude_toend != 0) {
+									if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_LEFT) {
+										//radius will grow
+										vec_x_shift = (vec_x_toend / magnitude_toend) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										vec_y_shift = (vec_y_toend / magnitude_toend) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+									} else if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_RIGHT) {
+										//radius will shrink
+										vec_x_shift = -(vec_x_toend / magnitude_toend) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										vec_y_shift = -(vec_y_toend / magnitude_toend) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+									} else {
+										std::cout << "cutter compensation not set correctly\n";
+										//skip changing endpoint
+										break;
+									}
+								}
+								endpoint_ptr->x = centerpoint_ptr->x + vec_x_toend + vec_x_shift;
+								endpoint_ptr->y = centerpoint_ptr->y + vec_y_toend + vec_y_shift;
+
+								break;
+							}
+							case(G_03): {
+								if(!centerpoint_ptr) break;
+								// double vec_x_tocenter = centerpoint_ptr->x - last_exact_gcode_point.x;
+								// double vec_y_tocenter = centerpoint_ptr->y - last_exact_gcode_point.y;
+								// double magnitude_tocenter = std::sqrt(std::pow(vec_x_tocenter,2) + std::pow(vec_y_tocenter,2));
+								// double vec_x_shift = 0;
+								// double vec_y_shift = 0;
+								// if(magnitude_tocenter != 0) {
+									// if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_LEFT) {
+										//radius will shrink
+										// vec_x_shift = -(vec_x_tocenter / magnitude_tocenter) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										// vec_y_shift = -(vec_y_tocenter / magnitude_tocenter) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+									// } else if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_RIGHT) {
+										//radius will grow
+										// vec_x_shift = (vec_x_tocenter / magnitude_tocenter) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										// vec_y_shift = (vec_y_tocenter / magnitude_tocenter) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+									// } else {
+										// std::cout << "cutter compensation not set correctly\n";
+										//skip changing endpoint
+										// break;
+									// }
+								// }
+								// centerpoint_ptr->x = last_exact_gcode_point.x + vec_x_tocenter + vec_x_shift;
+								// centerpoint_ptr->y = last_exact_gcode_point.y + vec_y_tocenter + vec_y_shift;
+								//center -> stop add offset
+								double vec_x_toend = endpoint_ptr->x - centerpoint_ptr->x;
+								double vec_y_toend = endpoint_ptr->y - centerpoint_ptr->y;
+								double magnitude_toend = std::sqrt(std::pow(vec_x_toend,2) + std::pow(vec_y_toend,2));
+								double vec_x_shift = 0;
+								double vec_y_shift = 0;
+								if(magnitude_toend != 0) {
+									if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_LEFT) {
+										//radius will shrink
+										vec_x_shift = -(vec_x_toend / magnitude_toend) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										vec_y_shift = -(vec_y_toend / magnitude_toend) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+									} else if(MachineParams::cutter_compensation_direction == CUTTER_COMPENSATION_RIGHT) {
+										//radius will grow
+										vec_x_shift = (vec_x_toend / magnitude_toend) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+										vec_y_shift = (vec_y_toend / magnitude_toend) * (MachineParams::currentTool_diameter_compensation->CutterCompensation[MachineParams::cutter_compensation_direction]*0.5);
+									} else {
+										std::cout << "cutter compensation not set correctly\n";
+										//skip changing endpoint
+										break;
+									}
+								}
+								endpoint_ptr->x = centerpoint_ptr->x + vec_x_toend + vec_x_shift;
+								endpoint_ptr->y = centerpoint_ptr->y + vec_y_toend + vec_y_shift;
+								break;
+							}
+							default: {
+								break;
+							}
+						}
+					}
+				}
+			}
 			if(current_work_offset) {
 				if(endpoint_ptr) {
 					endpoint_ptr->x += current_work_offset->x;
@@ -601,6 +925,20 @@ class CNC_GCODE_PROCESSING {
 
 				}
 			}
+			if(MachineParams::currentTool_offset) {
+				if(endpoint_ptr) {
+					endpoint_ptr->x += MachineParams::currentTool_offset->offset.x;
+					endpoint_ptr->y += MachineParams::currentTool_offset->offset.y;
+					endpoint_ptr->z += MachineParams::currentTool_offset->offset.z;
+				}
+				if(centerpoint_ptr) {
+					centerpoint_ptr->x += MachineParams::currentTool_offset->offset.x;
+					centerpoint_ptr->y += MachineParams::currentTool_offset->offset.y;
+					centerpoint_ptr->z += MachineParams::currentTool_offset->offset.z;
+
+				}
+			}
+
 			if(gcode_move_ptr) {
 				switch(*gcode_move_ptr) {
 					case(G_00): {
@@ -610,7 +948,7 @@ class CNC_GCODE_PROCESSING {
 							moveLine(*endpoint_ptr);
 							MachineParams::setFeedrate(oldFeedrate);
 						} else {
-							assert(0);
+							std::cout << "no endpoint defined-skipping move\n";
 						}
 						break;
 					}
@@ -649,13 +987,134 @@ class CNC_GCODE_PROCESSING {
 				}
 			}
 			if(endpoint_ptr) {
-				last_exact_gcode_point = *endpoint_ptr;
+				std::cout << "GCODE   Location " << current_exact_gcode_point.x << "," << current_exact_gcode_point.y << "," << current_exact_gcode_point.z << "\n";
+				std::cout << "Machine Location " << MotorQuadrantPosition.x << "," << MotorQuadrantPosition.y << "," << MotorQuadrantPosition.z << "\n";
+				last_exact_gcode_point = current_exact_gcode_point;
+				last_corrected_gcode_position = *endpoint_ptr;
 			}
 		}
 		cncHardwareControl::flush();
 		cncHardwareControl::ForceWriteDMA();
 	}
 
+	static bool GCODE_PEEKFORCUTTERCOMP(std::string line, const struct coordinate_s *ref_start, GCODE_INSTRUCTION_TYPES **_gcode_move,struct coordinate_s **_endpoint, struct coordinate_s **_centerpoint) {
+		static enum GCODE_INSTRUCTION_TYPES gcode_move;
+		static struct coordinate_s endpoint;
+		static struct coordinate_s centerpoint;
+		//update coordi
+		*_gcode_move = nullptr;
+		*_endpoint = nullptr;
+		*_centerpoint = nullptr;
+
+		char space_del = ' ';
+		std::vector<std::string> words;
+		std::stringstream ss(line);
+		std::string temp_s;
+		while(std::getline(ss, temp_s, space_del)) {
+			words.push_back(temp_s);
+		}
+
+		endpoint = *ref_start;
+		centerpoint = *ref_start;
+
+		for(auto word = words.begin(); word < words.end(); word++) {
+			if(word->length() == 1) {
+				//this is mainly to deal with a comment word with a single ( ex. N1 G00 ( comment )
+				//for now just skip everything after this - todo: more gracefully remove comments
+				goto END_PARSE_COMMENT;
+			}
+			if(word->length() >= 2) {
+				char first_char = (*word)[0];
+				// std::cout << first_char << "\n";
+				word->erase(word->begin());
+
+				switch(first_char) {
+					case('G'):{
+						int temp_i = std::stoi(*word);
+						switch(temp_i) {
+							case(0): {
+								//rapid
+								*_gcode_move = &gcode_move;
+								gcode_move = G_00;
+								break;
+							}
+							case(1): {
+								//linear
+								*_gcode_move = &gcode_move;
+								gcode_move = G_01;
+								break;
+							}
+							case(2): {
+								//clockwise circle
+								*_gcode_move = &gcode_move;
+								gcode_move = G_02;
+								break;
+							}
+							case(3): {
+								//counterclockwise circle
+								*_gcode_move = &gcode_move;
+								gcode_move = G_03;
+								break;
+							}
+							default: {
+								break;
+							}
+						}
+						break;
+					}
+					case('X'): {
+						double temp_d = std::stod(*word);
+						*_endpoint = &endpoint;
+						endpoint.x = temp_d;
+						break;
+					}
+					case('Y'): {
+						double temp_d = std::stod(*word);
+						*_endpoint = &endpoint;
+						endpoint.y = temp_d;
+						break;
+					}
+					case('Z'): {
+						double temp_d = std::stod(*word);
+						*_endpoint = &endpoint;
+						endpoint.z = temp_d;
+						break;
+					}
+					case('I'): {
+						double temp_d = std::stod(*word);
+						*_centerpoint = &centerpoint;
+						centerpoint.x = centerpoint.x + temp_d;
+						break;
+					}
+					case('J'): {
+						double temp_d = std::stod(*word);
+						*_centerpoint = &centerpoint;
+						centerpoint.y = centerpoint.y + temp_d;
+						break;
+					}
+					case('N'): {
+						break;
+					}
+					case('%'):
+					case('O'):
+					case('('):
+					{
+						goto END_PARSE_COMMENT;
+					}
+					default: {
+					}
+				}
+			}
+		}
+
+END_PARSE_COMMENT:
+		if(*_endpoint) {
+			//if we have an enpoint set and no other setup paramaters then run with the last move command
+			*_gcode_move = &gcode_move;
+		}
+		return false;	
+
+	}
 	static void GCODE_PARSE(std::string line, std::vector<enum GCODE_INSTRUCTION_TYPES> &_gcode_setup_list, GCODE_INSTRUCTION_TYPES **_gcode_move, 
 							struct coordinate_s **_endpoint, struct coordinate_s **_centerpoint, double **_feedrate, int **_toolnumber, int **_aux_data) {
 		static enum GCODE_INSTRUCTION_TYPES gcode_move;
@@ -682,6 +1141,7 @@ class CNC_GCODE_PROCESSING {
 		}
 
 		endpoint = last_exact_gcode_point;
+		centerpoint = last_exact_gcode_point;
 		
 		for(auto word = words.begin(); word < words.end(); word++) {
 			if(word->length() == 1) {
@@ -721,6 +1181,19 @@ class CNC_GCODE_PROCESSING {
 								gcode_move = G_03;
 								break;
 							}
+							case(43): {
+								//tool offset set - requires an H setting in the aux data
+								//also set rapid move if there is a Z setting
+								// *_gcode_move = &gcode_move;
+								// gcode_move = G_00;
+								_gcode_setup_list.push_back(G_43);
+								break;
+							}
+							case(49): {
+								//disable tool offset
+								_gcode_setup_list.push_back(G_49);
+								break;
+							}
 							case(17): {
 								//set XY plane
 								_gcode_setup_list.push_back(G_17);
@@ -736,8 +1209,24 @@ class CNC_GCODE_PROCESSING {
 								_gcode_setup_list.push_back(G_40);
 								break;
 							}
+							case(41): {
+								//tool compensation left hand side
+								_gcode_setup_list.push_back(G_41);
+								break;
+							}
+							case(53): {
+								//coordinate offset for workpiece
+								//also set rapid move if there is an endpoint
+								// *_gcode_move = &gcode_move;
+								// gcode_move = G_00;
+								_gcode_setup_list.push_back(G_53);
+								break;
+							}
 							case(54): {
 								//coordinate offset for workpiece
+								//also set rapid move if there is an endpoint
+								// *_gcode_move = &gcode_move;
+								// gcode_move = G_00;
 								_gcode_setup_list.push_back(G_54);
 								break;
 							}
@@ -781,6 +1270,21 @@ class CNC_GCODE_PROCESSING {
 								_gcode_setup_list.push_back(M_03);
 								break;
 							}
+							case(5): {
+								//turn on spindle
+								_gcode_setup_list.push_back(M_05);
+								break;
+							}
+							case(8): {
+								//coolant on
+								_gcode_setup_list.push_back(M_08);
+								break;
+							}
+							case(9): {
+								//coolant off
+								_gcode_setup_list.push_back(M_09);
+								break;
+							}
 							default: {
 								_gcode_setup_list.push_back(G_UNKOWN_STOP);
 								break;
@@ -790,12 +1294,19 @@ class CNC_GCODE_PROCESSING {
 					}
 					case('S'): {
 						//set spindle speed
-						int temp_i = std::stoi(*word);
-						*_aux_data = &aux_data;
-						aux_data = temp_i;
-						_gcode_setup_list.push_back(S_setspeed);
+						if(*_aux_data) {
+							//if aux data already set/ stop
+							_gcode_setup_list.clear();
+							_gcode_setup_list.push_back(G_UNKOWN_STOP);
+						} else {
+							int temp_i = std::stoi(*word);
+							*_aux_data = &aux_data;
+							aux_data = temp_i;
+							_gcode_setup_list.push_back(S_setspeed);
+						}
 						break;
 					}
+					
 					case('X'): {
 						double temp_d = std::stod(*word);
 						*_endpoint = &endpoint;
@@ -836,9 +1347,39 @@ class CNC_GCODE_PROCESSING {
 						break;
 					}
 					case('T'): {
-						int temp_int = std::stoi(*word);
-						*_toolnumber = &toolnumber;
-						toolnumber = temp_int;
+						//set tool number
+						if(*_toolnumber) {
+							_gcode_setup_list.clear();
+							_gcode_setup_list.push_back(G_UNKOWN_STOP);
+						} else {
+							int temp_i = std::stoi(*word);
+							*_toolnumber = &toolnumber;
+							toolnumber = temp_i;
+						}
+						break;
+					}
+					case('H'): {
+						//set tool offset number
+						if(*_toolnumber) {
+							_gcode_setup_list.clear();
+							_gcode_setup_list.push_back(G_UNKOWN_STOP);
+						} else {
+							int temp_i = std::stoi(*word);
+							*_toolnumber = &toolnumber;
+							toolnumber = temp_i;
+						}
+						break;
+					}
+					case('D'): {
+						//set tool offset number
+						if(*_toolnumber) {
+							_gcode_setup_list.clear();
+							_gcode_setup_list.push_back(G_UNKOWN_STOP);
+						} else {
+							int temp_i = std::stoi(*word);
+							*_toolnumber = &toolnumber;
+							toolnumber = temp_i;
+						}
 						break;
 					}
 					case('%'):
@@ -846,7 +1387,7 @@ class CNC_GCODE_PROCESSING {
 					case('('):
 					{
 						_gcode_setup_list.push_back(G_NOTELINE);
-						return;
+						goto END_PARSE_COMMENT;
 					}
 					default: {
 						_gcode_setup_list.push_back(G_UNKOWN_STOP);
@@ -855,7 +1396,8 @@ class CNC_GCODE_PROCESSING {
 			}
 		}
 
-		if(*_endpoint && _gcode_setup_list.empty()) {
+END_PARSE_COMMENT:
+		if(*_endpoint) {
 			//if we have an enpoint set and no other setup paramaters then run with the last move command
 			*_gcode_move = &gcode_move;
 		}
@@ -870,24 +1412,30 @@ class CNC_GCODE_PROCESSING {
 			fillPossibleLocations(MotorQuadrantPosition, MachineParams::x_mm_per_tick, MachineParams::y_mm_per_tick, MachineParams::z_mm_per_tick);
 
 			// check for Y vector only(no slope)
-			if(center.x == VirtualPosition.x) {
-				if((VirtualPosition.y - center.y) > 0) {
+			// if(center.x == VirtualPosition.x) {
+			if(center.x == MotorQuadrantPosition.x) {
+				// if((VirtualPosition.y - center.y) > 0) {
+				if((MotorQuadrantPosition.y - center.y) > 0) {
 					//mark x only directions;
 					mark_XOnly_Direction(clockwise?true:false);
 				} else {
 					mark_XOnly_Direction(clockwise?false:true);
 				}
-			} else if(center.y == VirtualPosition.y) {
-				if((VirtualPosition.x - center.x) > 0) {
+			// } else if(center.y == VirtualPosition.y) {
+			} else if(center.y == MotorQuadrantPosition.y) {
+				// if((VirtualPosition.x - center.x) > 0) {
+				if((MotorQuadrantPosition.x - center.x) > 0) {
 					mark_YOnly_Direction(clockwise?false:true);
 				} else {
 					mark_YOnly_Direction(clockwise?true:false);
 				}
 			} else{
-				double slope = (center.y - VirtualPosition.y) / (center.x - VirtualPosition.x);
+				// double slope = (center.y - VirtualPosition.y) / (center.x - VirtualPosition.x);
+				double slope = (center.y - MotorQuadrantPosition.y) / (center.x - MotorQuadrantPosition.x);
 				double p_slope = -1.0/slope;
 				//is circle vector pointing to pos x direction
-				bool center_to_circ_posx = (VirtualPosition.x - center.x) > 0;
+				// bool center_to_circ_posx = (VirtualPosition.x - center.x) > 0;
+				bool center_to_circ_posx = (MotorQuadrantPosition.x - center.x) > 0;
 				mark_XYcircle_PossibleLocations(clockwise?center_to_circ_posx:!center_to_circ_posx, p_slope);
 
 			}
@@ -905,13 +1453,15 @@ class CNC_GCODE_PROCESSING {
 					moveDirection = (CUBEPOSITIONS)i;
 				}
 			}
-			double current_distance = getDistanceBetweenPoints(VirtualPosition, end);
+			// double current_distance = getDistanceBetweenPoints(VirtualPosition, end);
+			double current_distance = getDistanceBetweenPoints(MotorQuadrantPosition, end);
 			//if current loc > max move dist, move or if next move is closer then move
-			if(current_distance > MachineParams::Max_Move_Distance || getDistanceBetweenPoints(VirtualOutcomePositions[moveDirection], end) < getDistanceBetweenPoints(VirtualPosition, end)) {
+			// if(current_distance > MachineParams::Max_Move_Distance || getDistanceBetweenPoints(VirtualOutcomePositions[moveDirection], end) < getDistanceBetweenPoints(VirtualPosition, end)) {
+			if(current_distance > MachineParams::Max_Move_Distance || getDistanceBetweenPoints(PossiblePositions[moveDirection], end) < getDistanceBetweenPoints(MotorQuadrantPosition, end)) {
 				MachineParams::writemotors(moveDirection);
-				VirtualPosition.x = VirtualOutcomePositions[moveDirection].x;
-				VirtualPosition.y = VirtualOutcomePositions[moveDirection].y;
-				VirtualPosition.z = VirtualOutcomePositions[moveDirection].z;
+				// VirtualPosition.x = VirtualOutcomePositions[moveDirection].x;
+				// VirtualPosition.y = VirtualOutcomePositions[moveDirection].y;
+				// VirtualPosition.z = VirtualOutcomePositions[moveDirection].z;
 				MotorQuadrantPosition.x = PossiblePositions[moveDirection].x;
 				MotorQuadrantPosition.y = PossiblePositions[moveDirection].y;
 				MotorQuadrantPosition.z = PossiblePositions[moveDirection].z;
@@ -923,9 +1473,10 @@ class CNC_GCODE_PROCESSING {
 	}
 
 	static void moveLine(struct coordinate_s end) {
-		bool Xdir = (last_exact_gcode_point.x - end.x) != 0;
-		bool Ydir = (last_exact_gcode_point.y - end.y) != 0;
-		bool Zdir = (last_exact_gcode_point.z - end.z) != 0;
+		//todo: for x/y only moves the coordinates will rarely match exactly so i need to check to see if x/y axis start/end positions will be close enough to ignore one of the axis
+		bool Xdir = (last_corrected_gcode_position.x - end.x) != 0;
+		bool Ydir = (last_corrected_gcode_position.y - end.y) != 0;
+		bool Zdir = (last_corrected_gcode_position.z - end.z) != 0;
 		bool keeprunning = true;
 		enum CUBEPOSITIONS moveDirection;
 		while(keeprunning){
@@ -934,50 +1485,55 @@ class CNC_GCODE_PROCESSING {
 
 			if(Xdir == true && Ydir == false && Zdir == false) {
 				//move x only
-				if((end.x - VirtualPosition.x) > 0) {
+				// if((end.x - VirtualPosition.x) > 0) {
+				if((end.x - MotorQuadrantPosition.x) > 0) {
 					moveDirection = X1Y0Z0;
-					VirtualOutcomePositions[X1Y0Z0].x = VirtualPosition.x + MachineParams::x_mm_per_tick;
-					VirtualOutcomePositions[X1Y0Z0].y = VirtualPosition.y;
-					VirtualOutcomePositions[X1Y0Z0].z = VirtualPosition.z;
+					// VirtualOutcomePositions[X1Y0Z0].x = VirtualPosition.x + MachineParams::x_mm_per_tick;
+					// VirtualOutcomePositions[X1Y0Z0].y = VirtualPosition.y;
+					// VirtualOutcomePositions[X1Y0Z0].z = VirtualPosition.z;
 				} else {
 					moveDirection = XN1Y0Z0;
-					VirtualOutcomePositions[XN1Y0Z0].x = VirtualPosition.x - MachineParams::x_mm_per_tick;
-					VirtualOutcomePositions[XN1Y0Z0].y = VirtualPosition.y;
-					VirtualOutcomePositions[XN1Y0Z0].z = VirtualPosition.z;
+					// VirtualOutcomePositions[XN1Y0Z0].x = VirtualPosition.x - MachineParams::x_mm_per_tick;
+					// VirtualOutcomePositions[XN1Y0Z0].y = VirtualPosition.y;
+					// VirtualOutcomePositions[XN1Y0Z0].z = VirtualPosition.z;
 				}
 			} else if(Xdir == false && Ydir == true && Zdir == false) {
 				//move y only
-				if((end.y - VirtualPosition.y) > 0) {
+				// if((end.y - VirtualPosition.y) > 0) {
+				if((end.y - MotorQuadrantPosition.y) > 0) {
 					moveDirection = X0Y1Z0;
-					VirtualOutcomePositions[X0Y1Z0].x = VirtualPosition.x;
-					VirtualOutcomePositions[X0Y1Z0].y = VirtualPosition.y + MachineParams::y_mm_per_tick;
-					VirtualOutcomePositions[X0Y1Z0].z = VirtualPosition.z;
+					// VirtualOutcomePositions[X0Y1Z0].x = VirtualPosition.x;
+					// VirtualOutcomePositions[X0Y1Z0].y = VirtualPosition.y + MachineParams::y_mm_per_tick;
+					// VirtualOutcomePositions[X0Y1Z0].z = VirtualPosition.z;
 				} else {
 					moveDirection = X0YN1Z0;
-					VirtualOutcomePositions[X0YN1Z0].x = VirtualPosition.x;
-					VirtualOutcomePositions[X0YN1Z0].y = VirtualPosition.y - MachineParams::y_mm_per_tick;
-					VirtualOutcomePositions[X0YN1Z0].z = VirtualPosition.z;
+					// VirtualOutcomePositions[X0YN1Z0].x = VirtualPosition.x;
+					// VirtualOutcomePositions[X0YN1Z0].y = VirtualPosition.y - MachineParams::y_mm_per_tick;
+					// VirtualOutcomePositions[X0YN1Z0].z = VirtualPosition.z;
 				}
 			} else if(Xdir == false && Ydir == false && Zdir == true) {
 				//move Z only
-				if((end.z - VirtualPosition.z) > 0) {
+				// if((end.z - VirtualPosition.z) > 0) {
+				if((end.z - MotorQuadrantPosition.z) > 0) {
 					moveDirection = X0Y0Z1;
-					VirtualOutcomePositions[X0Y0Z1].x = VirtualPosition.x;
-					VirtualOutcomePositions[X0Y0Z1].y = VirtualPosition.y;
-					VirtualOutcomePositions[X0Y0Z1].z = VirtualPosition.z + MachineParams::z_mm_per_tick;
+					// VirtualOutcomePositions[X0Y0Z1].x = VirtualPosition.x;
+					// VirtualOutcomePositions[X0Y0Z1].y = VirtualPosition.y;
+					// VirtualOutcomePositions[X0Y0Z1].z = VirtualPosition.z + MachineParams::z_mm_per_tick;
 				} else {
 					moveDirection = X0Y0ZN1;
-					VirtualOutcomePositions[X0Y0ZN1].x = VirtualPosition.x;
-					VirtualOutcomePositions[X0Y0ZN1].y = VirtualPosition.y;
-					VirtualOutcomePositions[X0Y0ZN1].z = VirtualPosition.z - MachineParams::z_mm_per_tick;
+					// VirtualOutcomePositions[X0Y0ZN1].x = VirtualPosition.x;
+					// VirtualOutcomePositions[X0Y0ZN1].y = VirtualPosition.y;
+					// VirtualOutcomePositions[X0Y0ZN1].z = VirtualPosition.z - MachineParams::z_mm_per_tick;
 				}
 				
 			} else if(Xdir == true && Ydir == true && Zdir == false) {
 				//move xy plane
-				double slope = (end.y - VirtualPosition.y) / (end.x - VirtualPosition.x);
+				// double slope = (end.y - VirtualPosition.y) / (end.x - VirtualPosition.x);
+				double slope = (end.y - last_corrected_gcode_position.y) / (end.x - last_corrected_gcode_position.x);
 				//y=mx+b
 				double b = end.y - (slope*end.x);
-				mark_XY_PossibleLocations(VirtualPosition, end);
+				// mark_XY_PossibleLocations(VirtualPosition, end);
+				mark_XY_PossibleLocations(MotorQuadrantPosition, end);
 				for(int i = 0; i < POS_LENGTH; i++) {
 					// std::cout << "made it here" << i << "\n";
 					if(PossiblePositions_bool[i]) {
@@ -1000,13 +1556,15 @@ class CNC_GCODE_PROCESSING {
 				//move xyz plane
 			}
 
-			double current_distance = getDistanceBetweenPoints(VirtualPosition, end);
+			// double current_distance = getDistanceBetweenPoints(VirtualPosition, end);
+			double current_distance = getDistanceBetweenPoints(MotorQuadrantPosition, end);
 			//if current loc > max move dist, move or if next move is closer then move
-			if(current_distance > MachineParams::Max_Move_Distance || getDistanceBetweenPoints(VirtualOutcomePositions[moveDirection], end) < getDistanceBetweenPoints(VirtualPosition, end)) {
+			// if(current_distance > MachineParams::Max_Move_Distance || getDistanceBetweenPoints(VirtualOutcomePositions[moveDirection], end) < getDistanceBetweenPoints(VirtualPosition, end)) {
+			if(current_distance > MachineParams::Max_Move_Distance || getDistanceBetweenPoints(PossiblePositions[moveDirection], end) < getDistanceBetweenPoints(MotorQuadrantPosition, end)) {
 				MachineParams::writemotors(moveDirection);
-				VirtualPosition.x = VirtualOutcomePositions[moveDirection].x;
-				VirtualPosition.y = VirtualOutcomePositions[moveDirection].y;
-				VirtualPosition.z = VirtualOutcomePositions[moveDirection].z;
+				// VirtualPosition.x = VirtualOutcomePositions[moveDirection].x;
+				// VirtualPosition.y = VirtualOutcomePositions[moveDirection].y;
+				// VirtualPosition.z = VirtualOutcomePositions[moveDirection].z;
 				MotorQuadrantPosition.x = PossiblePositions[moveDirection].x;
 				MotorQuadrantPosition.y = PossiblePositions[moveDirection].y;
 				MotorQuadrantPosition.z = PossiblePositions[moveDirection].z;
@@ -1020,11 +1578,17 @@ class CNC_GCODE_PROCESSING {
 	static double getDistanceBetweenPoints(const struct coordinate_s &p1, const struct coordinate_s &p2) {
 		return std::sqrt(std::pow((p1.x - p2.x),2) + std::pow((p1.y - p2.y), 2) + std::pow((p1.z - p2.z), 2));
 	}
+	static void get_line_line_intersection(const double &slope1, const double &b1, const double &slope2, const double &b2, struct coordinate_s *intersection) {
+		intersection->x = (b1 - b2) / (slope2 - slope1);
+		intersection->y = slope1 * intersection->x + b1;
+	}
 	static double get_XY_DistanceToLine(const double &slope, const double &b, const struct coordinate_s &point, struct coordinate_s *closest_point) {
+		//todo check for divide by 0
 		double parallel_slope = -1/slope;
 		double parallel_b = point.y - (parallel_slope*point.x);
-		closest_point->x = (b - parallel_b) / (parallel_slope - slope);
-		closest_point->y = slope * closest_point->x + b;
+		get_line_line_intersection(slope, b, parallel_slope, parallel_b, closest_point);
+		// closest_point->x = (b - parallel_b) / (parallel_slope - slope);
+		// closest_point->y = slope * closest_point->x + b;
 		closest_point->z = point.z;
 
 		return getDistanceBetweenPoints(point, *closest_point);
@@ -1290,8 +1854,10 @@ class CNC_GCODE_PROCESSING {
 std::vector<std::string> CNC_GCODE_PROCESSING::fileContents;
 	
 struct coordinate_s CNC_GCODE_PROCESSING::MotorQuadrantPosition = {0};
-struct coordinate_s CNC_GCODE_PROCESSING::VirtualPosition = {0};
+// struct coordinate_s CNC_GCODE_PROCESSING::VirtualPosition = {0};
+struct coordinate_s CNC_GCODE_PROCESSING::last_corrected_gcode_position = {0};
 struct coordinate_s CNC_GCODE_PROCESSING::last_exact_gcode_point = {0};
+struct coordinate_s CNC_GCODE_PROCESSING::current_exact_gcode_point = {0};
 struct coordinate_s CNC_GCODE_PROCESSING::PossiblePositions[POS_LENGTH];
 struct coordinate_s CNC_GCODE_PROCESSING::VirtualOutcomePositions[POS_LENGTH];
 bool CNC_GCODE_PROCESSING::PossiblePositions_bool[POS_LENGTH];
@@ -1303,6 +1869,8 @@ int main() {
 	std::cout << "!!!Hello World!!!" << std::endl; // prints !!!Hello World!!!
 	cncHardwareControl::total_time = 0;
 	MachineParams::init();
+	MachineParams::Tools[3].CutterCompensation[0] = -0.02;
+	MachineParams::Tools[3].CutterCompensation[1] = -0.02;
 	// struct pollfd pfd;
     // int ret;
     // std::cout << sizeof(CNC_OP_DataStructure) << "\n";
